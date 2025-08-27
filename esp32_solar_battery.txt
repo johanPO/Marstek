@@ -1,0 +1,311 @@
+#include <WiFi.h>
+#include <HardwareSerial.h>
+
+// Optional WiFi/MQTT for monitoring (can be disabled)
+#define ENABLE_WIFI_MQTT false  // Set to true if you want remote monitoring
+
+#if ENABLE_WIFI_MQTT
+#include <PubSubClient.h>
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const char* mqtt_server = "YOUR_MQTT_BROKER";
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+#endif
+
+// RS485 pin definitions for NodeMCU ESP32
+#define RS485_RX_PRO380    16    // GPIO16 - PRO380 sniffer (RX only)
+#define RS485_RX_MARSTEK   17    // GPIO17 - Marstek RX  
+#define RS485_TX_MARSTEK   4     // GPIO4  - Marstek TX
+#define RS485_DE_MARSTEK   2     // GPIO2  - Marstek direction control
+
+// Power thresholds (watts)
+#define POWER_DEADBAND     100   // ±100W deadband to prevent oscillation
+#define MAX_CHARGE_POWER   2500  // Marstek max charge rate
+#define MAX_DISCHARGE_POWER 2500 // Marstek max discharge rate (configurable)
+
+// Marstek Modbus registers
+#define MARSTEK_ADDR           1
+#define REG_CHARGE_POWER    32050    // A424: Forcible charge power (W)
+#define REG_DISCHARGE_POWER 32051    // A425: Forcible discharge power (W)  
+#define REG_BATTERY_SOC     32104    // A768: Battery SOC (%)
+#define REG_ABS_CONTROL     42000    // AA10: Enable ABS control mode
+
+// Global variables
+int16_t current_grid_power = 0;
+uint16_t battery_soc = 50;
+unsigned long last_battery_update = 0;
+unsigned long last_soc_check = 0;
+
+// Create serial objects
+HardwareSerial SerialPRO380(1);    // Use Serial1 for PRO380
+HardwareSerial SerialMarstek(2);   // Use Serial2 for Marstek
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("ESP32 Solar Battery Controller Starting...");
+  
+  // Initialize RS485 connections
+  setup_rs485_interfaces();
+  
+#if ENABLE_WIFI_MQTT
+  setup_wifi();
+  setup_mqtt();
+#endif
+  
+  // Enable Marstek ABS control mode
+  enable_marstek_control();
+  
+  Serial.println("System ready!");
+}
+
+void setup_rs485_interfaces() {
+  // PRO380 sniffer: 9600 baud, 8E1, RX only
+  SerialPRO380.begin(9600, SERIAL_8E1, RS485_RX_PRO380, -1);
+  Serial.println("PRO380 sniffer initialized (9600,8E1)");
+  
+  // Marstek control: 115200 baud, 8N1, full duplex
+  SerialMarstek.begin(115200, SERIAL_8N1, RS485_RX_MARSTEK, RS485_TX_MARSTEK);
+  
+  // Configure Marstek direction control pin
+  pinMode(RS485_DE_MARSTEK, OUTPUT);
+  digitalWrite(RS485_DE_MARSTEK, LOW);  // Start in receive mode
+  Serial.println("Marstek interface initialized (115200,8N1)");
+}
+
+#if ENABLE_WIFI_MQTT
+void setup_wifi() {
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.println("IP: " + WiFi.localIP().toString());
+  }
+}
+
+void setup_mqtt() {
+  mqtt.setServer(mqtt_server, 1883);
+  if (mqtt.connect("ESP32-Solar-Battery")) {
+    Serial.println("MQTT connected!");
+  }
+}
+
+void publish_mqtt_data() {
+  if (!mqtt.connected()) return;
+  
+  // Publish current readings
+  mqtt.publish("solar/grid_power", String(current_grid_power).c_str());
+  mqtt.publish("solar/battery_soc", String(battery_soc).c_str());
+  
+  // Publish battery status
+  String status = (current_grid_power < -POWER_DEADBAND) ? "charging" : 
+                  (current_grid_power > POWER_DEADBAND) ? "discharging" : "standby";
+  mqtt.publish("solar/battery_status", status.c_str());
+  
+  mqtt.loop();
+}
+#else
+void setup_wifi() {
+  // WiFi disabled
+  Serial.println("WiFi/MQTT disabled - running standalone");
+}
+#endif
+
+void loop() {
+  // Listen for PRO380 Modbus traffic
+  if (SerialPRO380.available()) {
+    parse_pro380_modbus();
+  }
+  
+  // Update battery control every 5 seconds
+  if (millis() - last_battery_update > 5000) {
+    update_battery_control();
+    last_battery_update = millis();
+    
+#if ENABLE_WIFI_MQTT
+    publish_mqtt_data();
+#endif
+  }
+  
+  // Check battery SOC every 30 seconds
+  if (millis() - last_soc_check > 30000) {
+    read_battery_soc();
+    last_soc_check = millis();
+  }
+  
+  delay(100);
+}
+
+void parse_pro380_modbus() {
+  static uint8_t buffer[256];
+  static int buffer_pos = 0;
+  
+  while (SerialPRO380.available()) {
+    buffer[buffer_pos] = SerialPRO380.read();
+    buffer_pos++;
+    
+    // Simple frame detection (look for valid Modbus response)
+    if (buffer_pos >= 8) {  // Minimum Modbus frame size
+      if (is_valid_modbus_frame(buffer, buffer_pos)) {
+        process_modbus_frame(buffer, buffer_pos);
+      }
+      buffer_pos = 0;  // Reset for next frame
+    }
+    
+    if (buffer_pos > 200) buffer_pos = 0;  // Prevent overflow
+  }
+}
+
+bool is_valid_modbus_frame(uint8_t* frame, int len) {
+  // Basic validation - check if it looks like Modbus RTU
+  if (len < 5) return false;
+  
+  uint8_t slave_addr = frame[0];
+  uint8_t function = frame[1];
+  
+  // Check for reasonable slave address and function code
+  return (slave_addr > 0 && slave_addr < 248 && function < 128);
+}
+
+void process_modbus_frame(uint8_t* frame, int len) {
+  uint8_t slave_addr = frame[0];
+  uint8_t function = frame[1];
+  
+  // Look for read holding register responses (function 03)
+  if (function == 0x03 && len >= 7) {
+    uint16_t register_start = (frame[2] << 8) | frame[3];
+    
+    // Check if this contains power data (register 30001 from KDK manual)
+    if (register_start == 30000 || register_start == 30001) {
+      // Extract power value (signed 16-bit)
+      current_grid_power = (int16_t)((frame[4] << 8) | frame[5]);
+      
+      Serial.print("Grid Power: ");
+      Serial.print(current_grid_power);
+      Serial.println("W");
+    }
+  }
+}
+
+void update_battery_control() {
+  uint16_t charge_power = 0;
+  uint16_t discharge_power = 0;
+  
+  // Calculate battery power based on grid import/export
+  if (current_grid_power < -POWER_DEADBAND) {  // Exporting to grid
+    // Excess solar - charge battery
+    charge_power = min(abs(current_grid_power), MAX_CHARGE_POWER);
+    Serial.print("Charging battery at ");
+    Serial.print(charge_power);
+    Serial.println("W");
+    
+  } else if (current_grid_power > POWER_DEADBAND) {  // Importing from grid
+    // Grid consumption - discharge battery (if SOC allows)
+    if (battery_soc > 20) {  // Don't discharge below 20%
+      discharge_power = min(current_grid_power, MAX_DISCHARGE_POWER);
+      Serial.print("Discharging battery at ");
+      Serial.print(discharge_power);
+      Serial.println("W");
+    }
+  } else {
+    Serial.println("Grid balanced - battery standby");
+  }
+  
+  // Send commands to Marstek
+  write_marstek_register(REG_CHARGE_POWER, charge_power);
+  write_marstek_register(REG_DISCHARGE_POWER, discharge_power);
+}
+
+void enable_marstek_control() {
+  Serial.println("Enabling Marstek ABS control mode...");
+  write_marstek_register(REG_ABS_CONTROL, 1);  // Enable external control
+  delay(1000);
+}
+
+void read_battery_soc() {
+  uint16_t soc = read_marstek_register(REG_BATTERY_SOC);
+  if (soc > 0 && soc <= 100) {
+    battery_soc = soc;
+    Serial.print("Battery SOC: ");
+    Serial.print(battery_soc);
+    Serial.println("%");
+  }
+}
+
+// Modbus helper functions
+void write_marstek_register(uint16_t reg, uint16_t value) {
+  uint8_t frame[8];
+  frame[0] = MARSTEK_ADDR;          // Slave address
+  frame[1] = 0x06;                  // Write single register
+  frame[2] = reg >> 8;              // Register high byte
+  frame[3] = reg & 0xFF;            // Register low byte  
+  frame[4] = value >> 8;            // Value high byte
+  frame[5] = value & 0xFF;          // Value low byte
+  
+  uint16_t crc = calculate_crc(frame, 6);
+  frame[6] = crc & 0xFF;            // CRC low byte
+  frame[7] = crc >> 8;              // CRC high byte
+  
+  // Switch to transmit mode
+  digitalWrite(RS485_DE_MARSTEK, HIGH);
+  delayMicroseconds(100);
+  
+  SerialMarstek.write(frame, 8);
+  SerialMarstek.flush();
+  
+  // Switch back to receive mode  
+  digitalWrite(RS485_DE_MARSTEK, LOW);
+  
+  delay(10);  // Small delay for response
+}
+
+uint16_t read_marstek_register(uint16_t reg) {
+  uint8_t frame[8];
+  frame[0] = MARSTEK_ADDR;
+  frame[1] = 0x03;                  // Read holding register
+  frame[2] = reg >> 8;
+  frame[3] = reg & 0xFF;
+  frame[4] = 0x00;                  // Read 1 register
+  frame[5] = 0x01;
+  
+  uint16_t crc = calculate_crc(frame, 6);
+  frame[6] = crc & 0xFF;
+  frame[7] = crc >> 8;
+  
+  // Send request
+  digitalWrite(RS485_DE_MARSTEK, HIGH);
+  delayMicroseconds(100);
+  SerialMarstek.write(frame, 8);
+  SerialMarstek.flush();
+  digitalWrite(RS485_DE_MARSTEK, LOW);
+  
+  // Read response
+  delay(50);
+  if (SerialMarstek.available() >= 7) {
+    uint8_t response[7];
+    SerialMarstek.readBytes(response, 7);
+    return (response[3] << 8) | response[4];  // Return register value
+  }
+  return 0;
+}
+
+uint16_t calculate_crc(uint8_t* data, int length) {
+  uint16_t crc = 0xFFFF;
+  for (int i = 0; i < length; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++) {
+      if (crc & 0x0001) {
+        crc >>= 1;
+        crc ^= 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
