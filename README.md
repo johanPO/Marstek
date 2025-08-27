@@ -18,7 +18,7 @@ This project uses an ESP32 to monitor your solar system's grid import/export and
 
 ### Solar System Setup
 - **Solar panels** with inverter (any AC-coupled system)
-- **Smart meter** KDK PRO380 (or compatible Modbus energy meter)
+- **Smart meter** SolarLog PRO380 (or compatible Modbus energy meter)
 - **SolarLog device** (SolarLog 50 + SolarLog 380PRO or similar)
 - **AC-coupled battery** Marstek/Duravolt 5.2kWh (or compatible)
 
